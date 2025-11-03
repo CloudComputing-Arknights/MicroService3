@@ -4,7 +4,7 @@ import os
 from typing import Optional, Literal
 import uuid
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Header
 import mysql.connector
 from pydantic import BaseModel, Field
 
@@ -56,8 +56,10 @@ try:
         offered_price FLOAT DEFAULT NULL,
         status ENUM('pending', 'accepted', 'rejected', 'canceled', 'completed') NOT NULL DEFAULT 'pending',
         message TEXT DEFAULT NULL,
+        idempotency_key VARCHAR(255) DEFAULT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_idempotency_key (idempotency_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
     cursor.execute(create_table_sql)
@@ -99,11 +101,26 @@ def root():
 # Transaction Endpoints
 # -----------------------------------------------------------------------------
 @app.post("/transactions/transaction", response_model=Transaction, status_code=status.HTTP_201_CREATED)
-def create_transaction(transaction: NewTransactionRequest):
+def create_transaction(
+    transaction: NewTransactionRequest,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key")
+):
     try:
+        # Check if idempotency key is provided and if transaction already exists
+        if x_idempotency_key:
+            cursor.execute(
+                "SELECT * FROM transactions WHERE idempotency_key = %s",
+                (x_idempotency_key,)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                # Return existing transaction (idempotent behavior)
+                return row_to_transaction(existing)
+        
+        # Create new transaction
         new_id = str(uuid.uuid4())
         cursor.execute(
-            "INSERT INTO transactions (transaction_id, requested_item_id, initiator_user_id, receiver_user_id, type, offered_item_id, offered_price, status, message) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO transactions (transaction_id, requested_item_id, initiator_user_id, receiver_user_id, type, offered_item_id, offered_price, status, message, idempotency_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 new_id,
                 transaction.requested_item_id,
@@ -114,6 +131,7 @@ def create_transaction(transaction: NewTransactionRequest):
                 transaction.offered_price,
                 transaction.status,
                 transaction.message,
+                x_idempotency_key,
             ),
         )
         conn.commit()
