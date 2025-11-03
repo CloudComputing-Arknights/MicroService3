@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Literal
+import uuid
 
 from fastapi import FastAPI, HTTPException, status
 import mysql.connector
@@ -42,24 +43,48 @@ try:
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor(dictionary=True)
     print("✅ Database connected successfully")
+    
+    # Create transactions table if it doesn't exist
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS transactions (
+        transaction_id VARCHAR(36) PRIMARY KEY,
+        requested_item_id VARCHAR(36) NOT NULL,
+        initiator_user_id VARCHAR(36) NOT NULL,
+        receiver_user_id VARCHAR(36) NOT NULL,
+        type ENUM('trade', 'purchase') NOT NULL,
+        offered_item_id VARCHAR(36) DEFAULT NULL,
+        offered_price FLOAT DEFAULT NULL,
+        status ENUM('pending', 'accepted', 'rejected', 'canceled', 'completed') NOT NULL DEFAULT 'pending',
+        message TEXT DEFAULT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
+    cursor.execute(create_table_sql)
+    conn.commit()
+    print("✅ Table 'transactions' ensured to exist")
 except Exception as e:
     print("❌ Database connection failed:", e)
 
 
 def row_to_transaction(row: dict) -> Transaction:
     return Transaction(
-        transactionId=row["transactionId"],
-        itemId=row["itemId"],
-        initiatorUserId=str(row["initiatorUserId"]),
-        receiverUserId=str(row["receiverUserId"]),
+        transaction_id=str(row["transaction_id"]),
+        requested_item_id=str(row["requested_item_id"]),
+        initiator_user_id=str(row["initiator_user_id"]),
+        receiver_user_id=str(row["receiver_user_id"]),
+        type=row["type"],
+        offered_item_id=(str(row["offered_item_id"]) if row.get("offered_item_id") is not None else None),
+        offered_price=row.get("offered_price"),
         status=row["status"],
-        createdAt=row["createdAt"],
-        updatedAt=row["updatedAt"],
+        message=row.get("message"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
 class UpdateStatusRequest(BaseModel):
-    status: Literal["completed", "canceled"] = Field(..., description="New status")
+    status: Literal["accepted", "rejected", "canceled", "completed"] = Field(..., description="New status")
 
 
 # -----------------------------------------------------------------------------
@@ -76,13 +101,23 @@ def root():
 @app.post("/transactions/transaction", response_model=Transaction, status_code=status.HTTP_201_CREATED)
 def create_transaction(transaction: NewTransactionRequest):
     try:
+        new_id = str(uuid.uuid4())
         cursor.execute(
-            "INSERT INTO transactions (itemId, initiatorUserId, receiverUserId, status) VALUES (%s, %s, %s, %s)",
-            (transaction.itemId, transaction.initiatorUserId, transaction.receiverUserId, transaction.status),
+            "INSERT INTO transactions (transaction_id, requested_item_id, initiator_user_id, receiver_user_id, type, offered_item_id, offered_price, status, message) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                new_id,
+                transaction.requested_item_id,
+                transaction.initiator_user_id,
+                transaction.receiver_user_id,
+                transaction.type,
+                transaction.offered_item_id,
+                transaction.offered_price,
+                transaction.status,
+                transaction.message,
+            ),
         )
         conn.commit()
-        new_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM transactions WHERE transactionId = %s", (new_id,))
+        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (new_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load created transaction")
@@ -93,10 +128,10 @@ def create_transaction(transaction: NewTransactionRequest):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@app.get("/transactions/{transactionId}", response_model=Transaction)
-def get_transaction(transactionId: int):
+@app.get("/transactions/{transaction_id}", response_model=Transaction)
+def get_transaction(transaction_id: str):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transactionId = %s", (transactionId,))
+        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
@@ -109,10 +144,11 @@ def get_transaction(transactionId: int):
 
 @app.get("/transactions", response_model=list[Transaction])
 def list_transactions(
-    status_param: Optional[Literal["pending", "completed", "canceled"]] = None,
-    initiatorUserId: Optional[str] = None,
-    receiverUserId: Optional[str] = None,
-    itemId: Optional[int] = None,
+    status_param: Optional[Literal["pending", "accepted", "rejected", "canceled", "completed"]] = None,
+    initiator_user_id: Optional[str] = None,
+    receiver_user_id: Optional[str] = None,
+    requested_item_id: Optional[str] = None,
+    type: Optional[Literal["trade", "purchase"]] = None,
     limit: int = 50,
     offset: int = 0,
 ):
@@ -122,18 +158,21 @@ def list_transactions(
         if status_param is not None:
             conditions.append("status = %s")
             params.append(status_param)
-        if initiatorUserId is not None:
-            conditions.append("initiatorUserId = %s")
-            params.append(initiatorUserId)
-        if receiverUserId is not None:
-            conditions.append("receiverUserId = %s")
-            params.append(receiverUserId)
-        if itemId is not None:
-            conditions.append("itemId = %s")
-            params.append(itemId)
+        if initiator_user_id is not None:
+            conditions.append("initiator_user_id = %s")
+            params.append(initiator_user_id)
+        if receiver_user_id is not None:
+            conditions.append("receiver_user_id = %s")
+            params.append(receiver_user_id)
+        if requested_item_id is not None:
+            conditions.append("requested_item_id = %s")
+            params.append(requested_item_id)
+        if type is not None:
+            conditions.append("type = %s")
+            params.append(type)
 
         where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        sql = f"SELECT * FROM transactions{where_clause} ORDER BY createdAt DESC LIMIT %s OFFSET %s"
+        sql = f"SELECT * FROM transactions{where_clause} ORDER BY created_at DESC LIMIT %s OFFSET %s"
         params.append(limit)
         params.append(offset)
         cursor.execute(sql, tuple(params))
@@ -143,16 +182,16 @@ def list_transactions(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@app.put("/transactions/{transactionId}", response_model=Transaction)
-def update_transaction(transactionId: int, payload: UpdateStatusRequest):
+@app.put("/transactions/{transaction_id}", response_model=Transaction)
+def update_transaction(transaction_id: str, payload: UpdateStatusRequest):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transactionId = %s", (transactionId,))
+        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
-        cursor.execute("UPDATE transactions SET status = %s WHERE transactionId = %s", (payload.status, transactionId))
+        cursor.execute("UPDATE transactions SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE transaction_id = %s", (payload.status, transaction_id))
         conn.commit()
-        cursor.execute("SELECT * FROM transactions WHERE transactionId = %s", (transactionId,))
+        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
         updated = cursor.fetchone()
         return row_to_transaction(updated)
     except HTTPException:
@@ -161,14 +200,14 @@ def update_transaction(transactionId: int, payload: UpdateStatusRequest):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@app.delete("/transactions/{transactionId}", response_model=Transaction)
-def delete_transaction(transactionId: int):
+@app.delete("/transactions/{transaction_id}", response_model=Transaction)
+def delete_transaction(transaction_id: str):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transactionId = %s", (transactionId,))
+        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
-        cursor.execute("DELETE FROM transactions WHERE transactionId = %s", (transactionId,))
+        cursor.execute("DELETE FROM transactions WHERE transaction_id = %s", (transaction_id,))
         conn.commit()
         return row_to_transaction(existing)
     except HTTPException:
