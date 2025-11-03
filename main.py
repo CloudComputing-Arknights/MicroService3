@@ -6,6 +6,8 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, status, Header
 import mysql.connector
+from mysql.connector import Error
+import threading, time
 from pydantic import BaseModel, Field
 
 from models.transaction import Transaction
@@ -29,22 +31,49 @@ app = FastAPI(
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Transaction API",
-    description="Am API to manage transactions.",
+    description="An API to manage transactions.",
     version="1.0.0",
 )
+
 db_config = {
-    "host": "136.113.127.151",          
-    "user": "microservice_3",             
-    "password": "arknights123",    
-    "database": "neighborhood_db"          
+    "host": "136.113.127.151",
+    "user": "microservice_3",
+    "password": "arknights123",
+    "database": "neighborhood_db",
+    "autocommit": True
 }
 
+
+def get_connection():
+    global conn
+    try:
+        if conn is None or not conn.is_connected():
+            print("🔄 Reconnecting to MySQL...")
+            conn = mysql.connector.connect(**db_config)
+            print("✅ Database connected successfully")
+        return conn
+    except Error as e:
+        print("❌ MySQL connection error:", e)
+        return None
+
+ 
+def keep_alive():
+    global conn
+    while True:
+        try:
+            if conn and conn.is_connected():
+                conn.ping(reconnect=True, attempts=3, delay=5)
+                print("✅ Ping successful")
+        except Exception as e:
+            print("⚠️ Ping failed:", e)
+        time.sleep(1800)  
+
+ 
 try:
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor(dictionary=True)
     print("✅ Database connected successfully")
-    
-    # Create transactions table if it doesn't exist
+
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS transactions (
         transaction_id VARCHAR(36) PRIMARY KEY,
@@ -67,8 +96,23 @@ try:
     print("✅ Table 'transactions' ensured to exist")
 except Exception as e:
     print("❌ Database connection failed:", e)
+    conn = None
 
 
+threading.Thread(target=keep_alive, daemon=True).start()
+ 
+@app.get("/ping-db")
+def ping_db():
+    conn = get_connection()
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT NOW() AS now_time;")
+        result = cursor.fetchone()
+        cursor.close()
+        return {"db_time": result["now_time"]}
+    else:
+        return {"error": "Database not connected"}
+        
 def row_to_transaction(row: dict) -> Transaction:
     return Transaction(
         transaction_id=str(row["transaction_id"]),
