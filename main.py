@@ -21,20 +21,14 @@ port = int(os.environ.get("FASTAPIPORT", 8000))
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Transaction API",
-    description="Am API to manage transactions.",
-    version="1.0.0",
-)
-
-
-# -----------------------------------------------------------------------------
-# Connect to db
-# -----------------------------------------------------------------------------
-app = FastAPI(
-    title="Transaction API",
     description="An API to manage transactions.",
     version="1.0.0",
 )
 
+
+# -----------------------------------------------------------------------------
+# Database Configuration
+# -----------------------------------------------------------------------------
 db_config = {
     "host": "136.113.127.151",
     "user": "microservice_3",
@@ -77,11 +71,7 @@ try:
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS transactions (
         transaction_id VARCHAR(36) PRIMARY KEY,
-        requested_item_id VARCHAR(36) NOT NULL,
-        initiator_user_id VARCHAR(36) NOT NULL,
-        receiver_user_id VARCHAR(36) NOT NULL,
         type ENUM('trade', 'purchase') NOT NULL,
-        offered_item_id VARCHAR(36) DEFAULT NULL,
         offered_price FLOAT DEFAULT NULL,
         status ENUM('pending', 'accepted', 'rejected', 'canceled', 'completed') NOT NULL DEFAULT 'pending',
         message TEXT DEFAULT NULL,
@@ -113,14 +103,11 @@ def ping_db():
     else:
         return {"error": "Database not connected"}
         
+
 def row_to_transaction(row: dict) -> Transaction:
     return Transaction(
         transaction_id=str(row["transaction_id"]),
-        requested_item_id=str(row["requested_item_id"]),
-        initiator_user_id=str(row["initiator_user_id"]),
-        receiver_user_id=str(row["receiver_user_id"]),
         type=row["type"],
-        offered_item_id=(str(row["offered_item_id"]) if row.get("offered_item_id") is not None else None),
         offered_price=row.get("offered_price"),
         status=row["status"],
         message=row.get("message"),
@@ -164,14 +151,10 @@ def create_transaction(
         # Create new transaction
         new_id = str(uuid.uuid4())
         cursor.execute(
-            "INSERT INTO transactions (transaction_id, requested_item_id, initiator_user_id, receiver_user_id, type, offered_item_id, offered_price, status, message, idempotency_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO transactions (transaction_id, type, offered_price, status, message, idempotency_key) VALUES (%s, %s, %s, %s, %s, %s)",
             (
                 new_id,
-                transaction.requested_item_id,
-                transaction.initiator_user_id,
-                transaction.receiver_user_id,
                 transaction.type,
-                transaction.offered_item_id,
                 transaction.offered_price,
                 transaction.status,
                 transaction.message,
@@ -207,9 +190,6 @@ def get_transaction(transaction_id: str):
 @app.get("/transactions", response_model=list[Transaction])
 def list_transactions(
     status_param: Optional[Literal["pending", "accepted", "rejected", "canceled", "completed"]] = None,
-    initiator_user_id: Optional[str] = None,
-    receiver_user_id: Optional[str] = None,
-    requested_item_id: Optional[str] = None,
     type: Optional[Literal["trade", "purchase"]] = None,
     limit: int = 50,
     offset: int = 0,
@@ -220,15 +200,6 @@ def list_transactions(
         if status_param is not None:
             conditions.append("status = %s")
             params.append(status_param)
-        if initiator_user_id is not None:
-            conditions.append("initiator_user_id = %s")
-            params.append(initiator_user_id)
-        if receiver_user_id is not None:
-            conditions.append("receiver_user_id = %s")
-            params.append(receiver_user_id)
-        if requested_item_id is not None:
-            conditions.append("requested_item_id = %s")
-            params.append(requested_item_id)
         if type is not None:
             conditions.append("type = %s")
             params.append(type)
