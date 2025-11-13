@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 from typing import Optional, Literal
 import uuid
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, status, Header
-import mysql.connector
-from mysql.connector import Error
-import threading, time
+from fastapi import FastAPI, HTTPException, status, Header, Depends
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import String, Float, Text, DateTime, Enum, select, func
 from pydantic import BaseModel, Field
 
 from models.transaction import Transaction
@@ -27,92 +28,104 @@ app = FastAPI(
 
 
 # -----------------------------------------------------------------------------
-# Database Configuration
+# Database Configuration with SQLAlchemy
 # -----------------------------------------------------------------------------
-db_config = {
-    "host": "136.113.127.151",
-    "user": "microservice_3",
-    "password": "arknights123",
-    "database": "neighborhood_db",
-    "autocommit": True
-}
+DATABASE_URL = "mysql+aiomysql://microservice_3:arknights123@136.113.127.151/neighborhood_db"
+
+# Create async engine
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,  # Set to True for SQL logging
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20
+)
+
+# Create async session factory
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
 
 
-def get_connection():
-    global conn
+# -----------------------------------------------------------------------------
+# SQLAlchemy Models
+# -----------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+
+class TransactionDB(Base):
+    __tablename__ = "transactions"
+    
+    transaction_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    type: Mapped[str] = mapped_column(Enum("trade", "purchase"), nullable=False)
+    offered_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(
+        Enum("pending", "accepted", "rejected", "canceled", "completed"),
+        nullable=False,
+        default="pending"
+    )
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now()
+    )
+
+
+# -----------------------------------------------------------------------------
+# Database Lifecycle
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_db():
+    """Initialize database on startup"""
     try:
-        if conn is None or not conn.is_connected():
-            print("🔄 Reconnecting to MySQL...")
-            conn = mysql.connector.connect(**db_config)
-            print("✅ Database connected successfully")
-        return conn
-    except Error as e:
-        print("❌ MySQL connection error:", e)
-        return None
+        async with engine.begin() as conn:
+            # Create tables if they don't exist
+            await conn.run_sync(Base.metadata.create_all)
+        print("✅ Database initialized successfully")
+        print("✅ Table 'transactions' ensured to exist")
+    except Exception as e:
+        print(f"❌ Database initialization failed: {e}")
 
- 
-def keep_alive():
-    global conn
-    while True:
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    """Close database connections on shutdown"""
+    await engine.dispose()
+    print("✅ Database connections closed")
+
+
+# -----------------------------------------------------------------------------
+# Dependency to get DB session
+# -----------------------------------------------------------------------------
+async def get_db():
+    """Dependency to get database session"""
+    async with AsyncSessionLocal() as session:
         try:
-            if conn and conn.is_connected():
-                conn.ping(reconnect=True, attempts=3, delay=5)
-                print("✅ Ping successful")
-        except Exception as e:
-            print("⚠️ Ping failed:", e)
-        time.sleep(1800)  
-
- 
-try:
-    conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor(dictionary=True)
-    print("✅ Database connected successfully")
-
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS transactions (
-        transaction_id VARCHAR(36) PRIMARY KEY,
-        type ENUM('trade', 'purchase') NOT NULL,
-        offered_price FLOAT DEFAULT NULL,
-        status ENUM('pending', 'accepted', 'rejected', 'canceled', 'completed') NOT NULL DEFAULT 'pending',
-        message TEXT DEFAULT NULL,
-        idempotency_key VARCHAR(255) DEFAULT NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY unique_idempotency_key (idempotency_key)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """
-    cursor.execute(create_table_sql)
-    conn.commit()
-    print("✅ Table 'transactions' ensured to exist")
-except Exception as e:
-    print("❌ Database connection failed:", e)
-    conn = None
+            yield session
+        finally:
+            await session.close()
 
 
-threading.Thread(target=keep_alive, daemon=True).start()
- 
-@app.get("/ping-db")
-def ping_db():
-    conn = get_connection()
-    if conn:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT NOW() AS now_time;")
-        result = cursor.fetchone()
-        cursor.close()
-        return {"db_time": result["now_time"]}
-    else:
-        return {"error": "Database not connected"}
-        
-
-def row_to_transaction(row: dict) -> Transaction:
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+def db_to_transaction(db_transaction: TransactionDB) -> Transaction:
+    """Convert SQLAlchemy model to Pydantic model"""
     return Transaction(
-        transaction_id=str(row["transaction_id"]),
-        type=row["type"],
-        offered_price=row.get("offered_price"),
-        status=row["status"],
-        message=row.get("message"),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        transaction_id=db_transaction.transaction_id,
+        type=db_transaction.type,
+        offered_price=db_transaction.offered_price,
+        status=db_transaction.status,
+        message=db_transaction.message,
+        created_at=db_transaction.created_at,
+        updated_at=db_transaction.updated_at,
     )
 
 
@@ -124,63 +137,73 @@ class UpdateStatusRequest(BaseModel):
 # Root Endpoint
 # -----------------------------------------------------------------------------
 @app.get("/")
-def root():
+async def root():
     return {"message": "Welcome to the Transaction API. See /docs for details."}
+
+
+@app.get("/ping-db")
+async def ping_db(db: AsyncSession = Depends(get_db)):
+    """Health check endpoint for database"""
+    try:
+        result = await db.execute(select(func.now()))
+        db_time = result.scalar()
+        return {"db_time": db_time}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # -----------------------------------------------------------------------------
 # Transaction Endpoints
 # -----------------------------------------------------------------------------
 @app.post("/transactions/transaction", response_model=Transaction, status_code=status.HTTP_201_CREATED)
-def create_transaction(
+async def create_transaction(
     transaction: NewTransactionRequest,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key")
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    db: AsyncSession = Depends(get_db)
 ):
     try:
         # Check if idempotency key is provided and if transaction already exists
         if x_idempotency_key:
-            cursor.execute(
-                "SELECT * FROM transactions WHERE idempotency_key = %s",
-                (x_idempotency_key,)
-            )
-            existing = cursor.fetchone()
+            stmt = select(TransactionDB).where(TransactionDB.idempotency_key == x_idempotency_key)
+            result = await db.execute(stmt)
+            existing = result.scalar_one_or_none()
             if existing:
                 # Return existing transaction (idempotent behavior)
-                return row_to_transaction(existing)
+                return db_to_transaction(existing)
         
         # Create new transaction
-        new_id = str(uuid.uuid4())
-        cursor.execute(
-            "INSERT INTO transactions (transaction_id, type, offered_price, status, message, idempotency_key) VALUES (%s, %s, %s, %s, %s, %s)",
-            (
-                new_id,
-                transaction.type,
-                transaction.offered_price,
-                transaction.status,
-                transaction.message,
-                x_idempotency_key,
-            ),
+        new_transaction = TransactionDB(
+            transaction_id=str(uuid.uuid4()),
+            type=transaction.type,
+            offered_price=transaction.offered_price,
+            status=transaction.status,
+            message=transaction.message,
+            idempotency_key=x_idempotency_key,
         )
-        conn.commit()
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (new_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load created transaction")
-        return row_to_transaction(row)
+        
+        db.add(new_transaction)
+        await db.commit()
+        await db.refresh(new_transaction)
+        
+        return db_to_transaction(new_transaction)
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.get("/transactions/{transaction_id}", response_model=Transaction)
-def get_transaction(transaction_id: str):
+async def get_transaction(transaction_id: str, db: AsyncSession = Depends(get_db)):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
-        row = cursor.fetchone()
-        if not row:
+        stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
+        result = await db.execute(stmt)
+        db_transaction = result.scalar_one_or_none()
+        
+        if not db_transaction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
-        return row_to_transaction(row)
+        
+        return db_to_transaction(db_transaction)
     except HTTPException:
         raise
     except Exception as e:
@@ -188,64 +211,82 @@ def get_transaction(transaction_id: str):
 
 
 @app.get("/transactions", response_model=list[Transaction])
-def list_transactions(
+async def list_transactions(
     status_param: Optional[Literal["pending", "accepted", "rejected", "canceled", "completed"]] = None,
     type: Optional[Literal["trade", "purchase"]] = None,
     limit: int = 50,
     offset: int = 0,
+    db: AsyncSession = Depends(get_db)
 ):
     try:
-        conditions = []
-        params: list = []
+        stmt = select(TransactionDB)
+        
+        # Apply filters
         if status_param is not None:
-            conditions.append("status = %s")
-            params.append(status_param)
+            stmt = stmt.where(TransactionDB.status == status_param)
         if type is not None:
-            conditions.append("type = %s")
-            params.append(type)
-
-        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        sql = f"SELECT * FROM transactions{where_clause} ORDER BY created_at DESC LIMIT %s OFFSET %s"
-        params.append(limit)
-        params.append(offset)
-        cursor.execute(sql, tuple(params))
-        rows = cursor.fetchall()
-        return [row_to_transaction(r) for r in rows]
+            stmt = stmt.where(TransactionDB.type == type)
+        
+        # Order and paginate
+        stmt = stmt.order_by(TransactionDB.created_at.desc()).limit(limit).offset(offset)
+        
+        result = await db.execute(stmt)
+        db_transactions = result.scalars().all()
+        
+        return [db_to_transaction(t) for t in db_transactions]
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.put("/transactions/{transaction_id}", response_model=Transaction)
-def update_transaction(transaction_id: str, payload: UpdateStatusRequest):
+async def update_transaction(
+    transaction_id: str,
+    payload: UpdateStatusRequest,
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
-        existing = cursor.fetchone()
-        if not existing:
+        stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
+        result = await db.execute(stmt)
+        db_transaction = result.scalar_one_or_none()
+        
+        if not db_transaction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
-        cursor.execute("UPDATE transactions SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE transaction_id = %s", (payload.status, transaction_id))
-        conn.commit()
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
-        updated = cursor.fetchone()
-        return row_to_transaction(updated)
+        
+        # Update status
+        db_transaction.status = payload.status
+        
+        await db.commit()
+        await db.refresh(db_transaction)
+        
+        return db_to_transaction(db_transaction)
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.delete("/transactions/{transaction_id}", response_model=Transaction)
-def delete_transaction(transaction_id: str):
+async def delete_transaction(transaction_id: str, db: AsyncSession = Depends(get_db)):
     try:
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = %s", (transaction_id,))
-        existing = cursor.fetchone()
-        if not existing:
+        stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
+        result = await db.execute(stmt)
+        db_transaction = result.scalar_one_or_none()
+        
+        if not db_transaction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
-        cursor.execute("DELETE FROM transactions WHERE transaction_id = %s", (transaction_id,))
-        conn.commit()
-        return row_to_transaction(existing)
+        
+        # Store transaction data before deletion
+        transaction_data = db_to_transaction(db_transaction)
+        
+        await db.delete(db_transaction)
+        await db.commit()
+        
+        return transaction_data
     except HTTPException:
         raise
     except Exception as e:
+        await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
