@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Optional, Literal
 import uuid
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, status, Header, Depends
+from fastapi import FastAPI, HTTPException, status, Header, Depends, Request
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Float, Text, DateTime, Enum, select, func
@@ -18,6 +19,20 @@ port = int(os.environ.get("FASTAPIPORT", 8000))
 
 
 # -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('transaction_service.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
 # FastAPI App Definition
 # -----------------------------------------------------------------------------
 app = FastAPI(
@@ -25,6 +40,24 @@ app = FastAPI(
     description="An API to manage transactions.",
     version="1.0.0",
 )
+
+
+# -----------------------------------------------------------------------------
+# Request/Response Logging Middleware
+# -----------------------------------------------------------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests and responses"""
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] {request.method} {request.url.path} - Request started")
+    
+    try:
+        response = await call_next(request)
+        logger.info(f"[{request_id}] {request.method} {request.url.path} - Status: {response.status_code}")
+        return response
+    except Exception as e:
+        logger.error(f"[{request_id}] {request.method} {request.url.path} - Error: {str(e)}")
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -85,20 +118,24 @@ class TransactionDB(Base):
 async def startup_db():
     """Initialize database on startup"""
     try:
+        logger.info("Starting database initialization...")
         async with engine.begin() as conn:
             # Create tables if they don't exist
             await conn.run_sync(Base.metadata.create_all)
-        print("✅ Database initialized successfully")
-        print("✅ Table 'transactions' ensured to exist")
+        logger.info("Database initialized successfully")
+        logger.info("Table 'transactions' ensured to exist")
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
+        logger.error(f"Database initialization failed: {e}", exc_info=True)
 
 
 @app.on_event("shutdown")
 async def shutdown_db():
     """Close database connections on shutdown"""
-    await engine.dispose()
-    print("✅ Database connections closed")
+    try:
+        await engine.dispose()
+        logger.info("Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}", exc_info=True)
 
 
 # -----------------------------------------------------------------------------
@@ -138,6 +175,7 @@ class UpdateStatusRequest(BaseModel):
 # -----------------------------------------------------------------------------
 @app.get("/")
 async def root():
+    logger.info("Root endpoint accessed")
     return {"message": "Welcome to the Transaction API. See /docs for details."}
 
 
@@ -145,10 +183,13 @@ async def root():
 async def ping_db(db: AsyncSession = Depends(get_db)):
     """Health check endpoint for database"""
     try:
+        logger.info("Database health check initiated")
         result = await db.execute(select(func.now()))
         db_time = result.scalar()
+        logger.info(f"Database health check successful - DB time: {db_time}")
         return {"db_time": db_time}
     except Exception as e:
+        logger.error(f"Database health check failed: {e}", exc_info=True)
         return {"error": str(e)}
 
 
@@ -162,13 +203,15 @@ async def create_transaction(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        logger.info(f"Creating transaction - Type: {transaction.type}, Idempotency Key: {x_idempotency_key}")
+        
         # Check if idempotency key is provided and if transaction already exists
         if x_idempotency_key:
             stmt = select(TransactionDB).where(TransactionDB.idempotency_key == x_idempotency_key)
             result = await db.execute(stmt)
             existing = result.scalar_one_or_none()
             if existing:
-                # Return existing transaction (idempotent behavior)
+                logger.info(f"Idempotent request detected - Returning existing transaction: {existing.transaction_id}")
                 return db_to_transaction(existing)
         
         # Create new transaction
@@ -185,10 +228,12 @@ async def create_transaction(
         await db.commit()
         await db.refresh(new_transaction)
         
+        logger.info(f"Transaction created successfully - ID: {new_transaction.transaction_id}")
         return db_to_transaction(new_transaction)
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to create transaction: {e}", exc_info=True)
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -196,17 +241,22 @@ async def create_transaction(
 @app.get("/transactions/{transaction_id}", response_model=Transaction)
 async def get_transaction(transaction_id: str, db: AsyncSession = Depends(get_db)):
     try:
+        logger.info(f"Fetching transaction - ID: {transaction_id}")
+        
         stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
         result = await db.execute(stmt)
         db_transaction = result.scalar_one_or_none()
         
         if not db_transaction:
+            logger.warning(f"Transaction not found - ID: {transaction_id}")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
         
+        logger.info(f"Transaction retrieved successfully - ID: {transaction_id}")
         return db_to_transaction(db_transaction)
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to fetch transaction {transaction_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -219,6 +269,8 @@ async def list_transactions(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        logger.info(f"Listing transactions - Status: {status_param}, Type: {type}, Limit: {limit}, Offset: {offset}")
+        
         stmt = select(TransactionDB)
         
         # Apply filters
@@ -233,8 +285,10 @@ async def list_transactions(
         result = await db.execute(stmt)
         db_transactions = result.scalars().all()
         
+        logger.info(f"Retrieved {len(db_transactions)} transactions")
         return [db_to_transaction(t) for t in db_transactions]
     except Exception as e:
+        logger.error(f"Failed to list transactions: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -245,23 +299,29 @@ async def update_transaction(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        logger.info(f"Updating transaction - ID: {transaction_id}, New Status: {payload.status}")
+        
         stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
         result = await db.execute(stmt)
         db_transaction = result.scalar_one_or_none()
         
         if not db_transaction:
+            logger.warning(f"Transaction not found for update - ID: {transaction_id}")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
         
+        old_status = db_transaction.status
         # Update status
         db_transaction.status = payload.status
         
         await db.commit()
         await db.refresh(db_transaction)
         
+        logger.info(f"Transaction updated successfully - ID: {transaction_id}, Status: {old_status} -> {payload.status}")
         return db_to_transaction(db_transaction)
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to update transaction {transaction_id}: {e}", exc_info=True)
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -269,11 +329,14 @@ async def update_transaction(
 @app.delete("/transactions/{transaction_id}", response_model=Transaction)
 async def delete_transaction(transaction_id: str, db: AsyncSession = Depends(get_db)):
     try:
+        logger.info(f"Deleting transaction - ID: {transaction_id}")
+        
         stmt = select(TransactionDB).where(TransactionDB.transaction_id == transaction_id)
         result = await db.execute(stmt)
         db_transaction = result.scalar_one_or_none()
         
         if not db_transaction:
+            logger.warning(f"Transaction not found for deletion - ID: {transaction_id}")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
         
         # Store transaction data before deletion
@@ -282,10 +345,12 @@ async def delete_transaction(transaction_id: str, db: AsyncSession = Depends(get
         await db.delete(db_transaction)
         await db.commit()
         
+        logger.info(f"Transaction deleted successfully - ID: {transaction_id}")
         return transaction_data
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to delete transaction {transaction_id}: {e}", exc_info=True)
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -296,4 +361,5 @@ async def delete_transaction(transaction_id: str, db: AsyncSession = Depends(get
 if __name__ == "__main__":
     import uvicorn
 
+    logger.info(f"Starting Transaction API on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
